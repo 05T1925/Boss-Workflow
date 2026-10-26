@@ -1,0 +1,186 @@
+import contextlib
+import datetime as dt
+import io
+import logging
+import threading
+import traceback
+from typing import Any, Callable, List, Optional
+
+from fastapi import HTTPException
+
+
+class QueueWriter(io.TextIOBase):
+    def __init__(self, sink):
+        self.sink = sink
+        self.buffer = ""
+
+    def write(self, text):
+        if not text:
+            return 0
+        self.buffer += str(text)
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            line = line.rstrip("\r")
+            if line:
+                self.sink(line)
+        return len(text)
+
+    def flush(self):
+        if self.buffer:
+            self.sink(self.buffer.rstrip("\r"))
+            self.buffer = ""
+
+
+class QueueLogHandler(logging.Handler):
+    def __init__(self, sink):
+        super().__init__(logging.INFO)
+        self.sink = sink
+
+    def emit(self, record):
+        try:
+            self.sink(self.format(record))
+        except Exception:
+            pass
+
+
+class TaskManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.worker: Optional[threading.Thread] = None
+        self.current_crawler: Optional[Any] = None
+        self.current_stop: Optional[Callable[[], None]] = None
+        self.stop_requested = False
+        self.status = "ready"
+        self.running = False
+        self.crawl_authenticated = False
+        self.logs: List[str] = []
+
+    def append_log(self, message: str):
+        with self.lock:
+            timestamp = dt.datetime.now().strftime("%H:%M:%S")
+            self.logs.append(f"[{timestamp}] {message}")
+            self.logs = self.logs[-2000:]
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "running": self.running,
+                "status": self.status,
+                "crawlAuthenticated": self.crawl_authenticated,
+                "logCount": len(self.logs),
+                "logs": list(self.logs),
+            }
+
+    def start(
+        self,
+        label: str,
+        target,
+        stop_handler: Optional[Callable[[], None]] = None,
+        on_complete: Optional[Callable[[bool, str], None]] = None,
+    ):
+        with self.lock:
+            if self.worker and self.worker.is_alive():
+                raise HTTPException(status_code=409, detail="已有任务正在运行")
+            self.status = label
+            self.running = True
+            self.crawl_authenticated = False
+            self.current_stop = stop_handler
+            self.stop_requested = False
+            self.logs.clear()
+        self.append_log("任务已启动")
+
+        def runner():
+            success = False
+            completion_error = ""
+            try:
+                target()
+                with self.lock:
+                    stopped = self.stop_requested
+                    self.status = "stopped" if stopped else "ready"
+                    self.running = False
+                    self.current_crawler = None
+                    self.current_stop = None
+                if stopped:
+                    completion_error = "stopped"
+                    self.append_log("任务已停止，已获取的数据已完成保存")
+                else:
+                    success = True
+                    self.append_log("任务结束")
+            except Exception:
+                with self.lock:
+                    stopped = self.stop_requested
+                    self.status = "stopped" if stopped else "failed"
+                    self.running = False
+                    self.current_crawler = None
+                    self.current_stop = None
+                if stopped:
+                    completion_error = "stopped"
+                    self.append_log("任务已停止，已获取的数据已完成保存")
+                else:
+                    completion_error = traceback.format_exc()
+                    self.append_log(completion_error)
+            finally:
+                if on_complete:
+                    try:
+                        on_complete(success, completion_error)
+                    except Exception:
+                        self.append_log(traceback.format_exc())
+
+        self.worker = threading.Thread(target=runner, daemon=True)
+        self.worker.start()
+
+    def mark_crawl_authenticated(self):
+        with self.lock:
+            self.crawl_authenticated = True
+        self.append_log("[OK] 登录成功，Cookie 已生效，开始采集岗位")
+
+    def stop(self):
+        stop_handler = self.current_stop
+        if stop_handler:
+            self.append_log("收到终止请求，正在停止当前任务")
+            with self.lock:
+                self.status = "stopping"
+                self.stop_requested = True
+            try:
+                stop_handler()
+            except Exception:
+                self.append_log(traceback.format_exc())
+            return
+
+        crawler = self.current_crawler
+        if not crawler:
+            self.append_log("当前没有可终止的爬虫实例")
+            return
+        self.append_log("收到终止请求，正在保存中断数据并等待采集流程安全退出")
+        with self.lock:
+            self.status = "stopping"
+            self.stop_requested = True
+        try:
+            request_stop = getattr(crawler, "request_stop", None)
+            if callable(request_stop):
+                request_stop()
+            else:
+                crawler._stopped = True
+                crawler._save_partial()
+                crawler._safe_listen_stop()
+        except Exception:
+            self.append_log(traceback.format_exc())
+
+
+@contextlib.contextmanager
+def capture_task_output(task_manager: TaskManager):
+    writer = QueueWriter(task_manager.append_log)
+    handler = QueueLogHandler(task_manager.append_log)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
+    root_logger = logging.getLogger()
+    old_level = root_logger.level
+    if old_level > logging.INFO:
+        root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(handler)
+    try:
+        with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+            yield
+    finally:
+        writer.flush()
+        root_logger.removeHandler(handler)
+        root_logger.setLevel(old_level)
